@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=tiptoi Manager
+GenericName=tiptoi-Stift verwalten
+Comment=Inhalte für den tiptoi-Stift suchen, übertragen und verwalten
+Exec=@EXEC@
+Icon=tiptoi-manager
+Terminal=false
+Categories=Utility;Education;
+Keywords=tiptoi;Ravensburger;Stift;gme;Kinder;Buch;
+StartupNotify=true
+StartupWMClass=tiptoi-manager
