@@ -99,6 +99,20 @@ def esc(s):
     return GLib.markup_escape_text(s or "")
 
 
+ICON_FILE = os.path.join(HERE, "tiptoi-manager.svg")
+
+
+def app_icon(size):
+    """App-Icon als Gtk.Image in der gewünschten Größe (Datei neben dem Programm, sonst Symbolthema)."""
+    try:
+        pb = GdkPixbuf.Pixbuf.new_from_file_at_size(ICON_FILE, size, size)
+        return Gtk.Image.new_from_pixbuf(pb)
+    except (GLib.Error, TypeError):
+        img = Gtk.Image.new_from_icon_name("tiptoi-manager", Gtk.IconSize.DIALOG)
+        img.set_pixel_size(size)
+        return img
+
+
 def logo_markup(text="tiptoi"):
     return "".join(f'<span foreground="{LOGO_COLORS[i % len(LOGO_COLORS)]}">{esc(ch)}</span>'
                    for i, ch in enumerate(text))
@@ -512,6 +526,9 @@ class MainWindow(Gtk.ApplicationWindow):
         hb = Gtk.HeaderBar()
         hb.set_show_close_button(True)
         hb.set_title(core.APP_NAME)
+        hb_icon = app_icon(24)
+        hb_icon.set_tooltip_text(core.APP_NAME)
+        hb.pack_start(hb_icon)
         self.set_titlebar(hb)
 
         self.main_stack = Gtk.Stack()
@@ -650,6 +667,7 @@ class MainWindow(Gtk.ApplicationWindow):
         home.set_valign(Gtk.Align.CENTER)
         home.set_halign(Gtk.Align.CENTER)
         home.set_margin_bottom(60)
+        home.pack_start(app_icon(112), False, False, 0)
         logo = label(logo_markup(), ("logo",), xalign=0.5, markup=True)
         home.pack_start(logo, False, False, 0)
         sub = label("Bücher · Spiele · Puzzles · Globus", ("logo-sub",), xalign=0.5)
@@ -1377,7 +1395,10 @@ class App(Gtk.Application):
         d = Gtk.AboutDialog(transient_for=self.win, modal=True)
         d.set_program_name(core.APP_NAME)
         d.set_version(core.APP_VERSION)
-        d.set_logo_icon_name("tiptoi-manager")
+        try:
+            d.set_logo(GdkPixbuf.Pixbuf.new_from_file_at_size(ICON_FILE, 128, 128))
+        except (GLib.Error, TypeError):
+            d.set_logo_icon_name("tiptoi-manager")
         d.set_comments("Inhalte für den tiptoi-Stift unter Linux suchen, übertragen und verwalten.\n\n"
                        "Inoffizielles Werkzeug – nicht mit der Ravensburger AG verbunden. "
                        "tiptoi® ist eine eingetragene Marke der Ravensburger AG. "

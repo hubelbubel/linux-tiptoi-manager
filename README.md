@@ -1,5 +1,7 @@
 # tiptoi Manager für Linux Mint
 
+![tiptoi Manager für Linux Mint](docs/banner.png)
+
 Eine kleine Desktop-App (Python + GTK 3) für den tiptoi-Stift. Python + GTK 3 ist unter Linux Mint vorinstalliert.
 
 ## Was die App kann
@@ -24,6 +26,16 @@ cd linux-tiptoi-manager
 Danach findest du **tiptoi Manager** im Startmenü. Du kannst ihn auch im Terminal mit `tiptoi-manager` starten.
 Falls das Skript meldet, dass Python-GTK fehlt (bei Mint eigentlich nie):
 `sudo apt install python3-gi gir1.2-gtk-3.0`
+
+## Aktualisieren
+
+```bash
+cd ~/Projekte/linux-tiptoi-manager   # dort, wo du das Repo geklont hast
+git pull
+./install.sh
+```
+
+Danach die App neu starten. Deine Einstellungen, der Suchverlauf und die Inhalte auf dem Stift bleiben erhalten.
 
 Deinstallieren: `./uninstall.sh`
 

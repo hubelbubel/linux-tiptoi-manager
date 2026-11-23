@@ -41,7 +41,7 @@ except Exception:  # pragma: no cover
     Gio = None
 
 APP_NAME = "tiptoi Manager"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 USER_AGENT = f"tiptoi-manager-linux/{APP_VERSION} (+Linux Mint)"
 
 # --------------------------------------------------------------------------
