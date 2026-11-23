@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import csv
 import difflib
+import hashlib
 import html
 import io
 import json
@@ -29,6 +30,7 @@ import unicodedata
 import urllib.parse
 import urllib.request
 import zlib
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
 
@@ -41,7 +43,7 @@ except Exception:  # pragma: no cover
     Gio = None
 
 APP_NAME = "tiptoi Manager"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 USER_AGENT = f"tiptoi-manager-linux/{APP_VERSION} (+Linux Mint)"
 
 # --------------------------------------------------------------------------
@@ -60,6 +62,11 @@ HISTORY_FILE = os.path.join(CONFIG_DIR, "suchverlauf.json")
 DEFAULT_CONFIG = {
     # Offizielle, öffentlich abrufbare Liste aller Audiodateien (id, version, url, fileName)
     "catalog_url": "https://cdn.ravensburger.de/db/tiptoi.csv",
+    # Offizielles Serviceportal: Produktseiten mit Bild, Titel, Kategorie und Download-Link
+    "portal_url": "https://service.ravensburger.de/tiptoi%C2%AE/tiptoi%C2%AE_Audiodateien",
+    "portal_max_age_hours": 24 * 7,
+    "portal_max_pages": 2500,
+    "portal_parallel": 4,
     # Öffentliche Übersicht mit Titeln, Beschreibungen und Artikelnummern
     "metadata_url": "http://tiptoi.vakat.de/",
     # Vorschaubilder über die Artikelnummer. Platzhalter: {article} / {article5}
@@ -587,6 +594,10 @@ class CatalogItem:
     tagline: str = ""
     article: str = ""
     game_id: str = ""
+    image_url: str = ""      # Produktbild aus dem Serviceportal
+    category: str = ""       # z. B. „Bücher“, „Puzzles“
+    page_url: str = ""       # Produktseite im Serviceportal
+    alt_urls: list = field(default_factory=list)  # weitere Download-Adressen
     # Suchfelder
     _title_f: str = field(default="", repr=False)
     _title_words: list = field(default_factory=list, repr=False)
@@ -596,13 +607,17 @@ class CatalogItem:
     def prepare(self):
         self._title_f = skey(self.title + " " + pretty_title_from_filename(self.file_name))
         self._title_words = self._title_f.split()
-        self._desc_f = skey(" ".join([self.tagline, self.description, self.article]))
+        self._desc_f = skey(" ".join([self.tagline, self.description, self.article, self.category]))
         self._desc_words = self._desc_f.split()
 
+    @property
+    def image_key(self) -> str:
+        return self.image_url or self.article
+
     def image_urls(self, templates: list[str]) -> list[str]:
+        out = [self.image_url] if self.image_url else []
         if not self.article or not self.article.isdigit():
-            return []
-        out = []
+            return out
         for t in templates:
             try:
                 out.append(t.format(article=self.article, article5=self.article.zfill(5)))
@@ -807,6 +822,214 @@ class Catalog:
         return None
 
 
+# --------------------------------------------------------------------------
+# Offizielles Serviceportal (service.ravensburger.de)
+# --------------------------------------------------------------------------
+
+PORTAL_CACHE = "serviceportal.json"
+
+
+class _PageParser(HTMLParser):
+    """Sammelt Links, Bilder und Meta-Angaben einer Portalseite."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.links: list[str] = []
+        self.images: list[str] = []
+        self.og_title = ""
+        self.title = ""
+        self._in_title = False
+
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        if tag == "a" and a.get("href"):
+            self.links.append(a["href"])
+        elif tag == "img":
+            src = a.get("src") or a.get("data-src") or ""
+            if src:
+                self.images.append(src)
+        elif tag == "meta" and (a.get("property") or a.get("name")) in ("og:title",):
+            self.og_title = a.get("content") or ""
+        elif tag == "title":
+            self._in_title = True
+
+    def handle_endtag(self, tag):
+        if tag == "title":
+            self._in_title = False
+
+    def handle_data(self, data):
+        if self._in_title:
+            self.title += data
+
+
+def _is_logo(src: str) -> bool:
+    low = urllib.parse.unquote(src).lower()
+    return ("logo" in low or "/@public/" in low or "mindtouch.page#thumbnail" in low
+            or "icon" in low.rsplit("/", 1)[-1])
+
+
+def parse_portal_page(text: str, base_url: str) -> dict:
+    p = _PageParser()
+    try:
+        p.feed(text)
+        p.close()
+    except Exception:
+        pass
+    links, gmes = [], []
+    for h in p.links:
+        u = urllib.parse.urljoin(base_url, h.strip())
+        path = urllib.parse.urlparse(u).path
+        if path.lower().endswith(".gme"):
+            gmes.append(u)
+        else:
+            links.append(u.split("#", 1)[0])
+    imgs = [urllib.parse.urljoin(base_url, i) for i in p.images]
+    product_imgs = [i for i in imgs if "/@api/deki/files/" in i and not _is_logo(i)]
+    thumbs = [i for i in imgs if "mindtouch.page" in urllib.parse.unquote(i).lower()]
+    return {"links": links, "gme": gmes, "image": (product_imgs or thumbs or [""])[0],
+            "title": (p.og_title or p.title).strip()}
+
+
+def clean_portal_title(t: str):
+    """„tiptoi® Audiodatei Puzzle Bauernhof 00066 und 00136“ -> („Puzzle Bauernhof“, [00066, 00136])"""
+    t = re.sub(r"\s*[-–|]\s*Serviceportal Ravensburger\s*$", "", t or "").strip()
+    t = re.sub(r"^\s*tiptoi®?\s*Audiodatei(en)?\b\s*[:\-–]?\s*", "", t, flags=re.I)
+    articles = re.findall(r"\b\d{5}\b", t)
+    t = re.sub(r"[\s,(]*(\b\d{5}\b\s*(und|&|,|/|\+)?\s*)+\)?\s*$", "", t).strip(" -–:,")
+    return t, articles
+
+
+def _portal_category(page_url: str, root_url: str) -> str:
+    root = urllib.parse.unquote(urllib.parse.urlparse(root_url).path).rstrip("/")
+    path = urllib.parse.unquote(urllib.parse.urlparse(page_url).path)
+    rest = path[len(root):].strip("/").split("/")
+    if len(rest) < 2:
+        return ""
+    seg = rest[0].replace("_", " ")
+    seg = re.sub(r"^Audiodateien\s+tiptoi®?\s*", "", seg, flags=re.I)
+    seg = re.sub(r"^Wieso\?\s*Weshalb\?\s*Warum\?\s*Quiz$", "Quiz", seg)
+    return seg.strip()
+
+
+def _under_root(url: str, root_url: str) -> bool:
+    pu, pr = urllib.parse.urlparse(url), urllib.parse.urlparse(root_url)
+    if pu.netloc.lower() != pr.netloc.lower() or pu.query:
+        return False
+    a = urllib.parse.unquote(pu.path).rstrip("/").lower()
+    b = urllib.parse.unquote(pr.path).rstrip("/").lower()
+    return a.startswith(b + "/")
+
+
+def crawl_portal(cfg: dict | None = None, progress=None, cancel: threading.Event | None = None) -> list[dict]:
+    """Liest alle Produktseiten unterhalb der Audiodateien-Übersicht aus.
+    Ergebnis je Produkt: title, articles, category, image, gme, file, page."""
+    cfg = cfg or load_config()
+    root = cfg["portal_url"]
+    timeout = float(cfg.get("network_timeout_seconds", 25))
+    max_pages = int(cfg.get("portal_max_pages", 2500))
+    workers = max(1, min(8, int(cfg.get("portal_parallel", 4))))
+    seen = {urllib.parse.unquote(root).rstrip("/").lower()}
+    level = [root]
+    products: dict[str, dict] = {}
+    done = 0
+    errors = 0
+
+    def fetch(url):
+        try:
+            return url, parse_portal_page(_decode_text(http_get(url, timeout=timeout)), url)
+        except TiptoiError:
+            return url, None
+
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="portal") as pool:
+        depth = 0
+        while level and depth < 6 and done < max_pages:
+            nxt = []
+            batch = level[: max_pages - done]
+            for idx, (url, info) in enumerate(pool.map(fetch, batch)):
+                if cancel is not None and cancel.is_set():
+                    raise TiptoiError("Abgebrochen.")
+                done += 1
+                if info is None:
+                    errors += 1
+                    if progress:
+                        progress(done, done + (len(batch) - idx - 1) + len(nxt), len(products))
+                    continue
+                if info["gme"] and url != root:
+                    title, arts = clean_portal_title(info["title"])
+                    for g in dict.fromkeys(info["gme"]):
+                        fname = urllib.parse.unquote(g.rsplit("/", 1)[-1])
+                        key = norm_filename(fname)
+                        if key and key not in products:
+                            products[key] = {"title": title or pretty_title_from_filename(fname),
+                                             "articles": arts, "category": _portal_category(url, root),
+                                             "image": info["image"], "gme": g, "file": fname, "page": url}
+                for link in info["links"]:
+                    k = urllib.parse.unquote(link).rstrip("/").lower()
+                    if k not in seen and _under_root(link, root):
+                        seen.add(k)
+                        nxt.append(link)
+                if progress:
+                    progress(done, done + (len(batch) - idx - 1) + len(nxt), len(products))
+            level = nxt
+            depth += 1
+    if done and errors == done:
+        raise TiptoiError("Das Serviceportal ist nicht erreichbar.")
+    return list(products.values())
+
+
+def load_portal_cache():
+    """(Einträge, Zeitpunkt) oder ([], 0)."""
+    try:
+        with open(os.path.join(CACHE_DIR, PORTAL_CACHE), "r", encoding="utf-8") as f:
+            d = json.load(f)
+        return list(d.get("entries") or []), float(d.get("time") or 0)
+    except (OSError, ValueError):
+        return [], 0.0
+
+
+def save_portal_cache(entries: list[dict]) -> None:
+    path = _cache_path(PORTAL_CACHE)
+    tmp = path + ".part"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"time": time.time(), "entries": entries}, f, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
+def portal_cache_stale(cfg: dict | None = None) -> bool:
+    cfg = cfg or load_config()
+    entries, t = load_portal_cache()
+    return not entries or (time.time() - t) > float(cfg.get("portal_max_age_hours", 168)) * 3600
+
+
+def apply_portal(items: list[CatalogItem], entries: list[dict]):
+    """Ordnet Portaleinträge per Dateiname zu; fehlende Titel werden ergänzt. -> (zugeordnet, neu)"""
+    by_file = {norm_filename(i.file_name): i for i in items}
+    matched = added = 0
+    for e in entries:
+        key = norm_filename(e.get("file", ""))
+        if not key:
+            continue
+        it = by_file.get(key)
+        if it is None:
+            it = CatalogItem("", "", e["gme"], e["file"], e.get("title") or pretty_title_from_filename(e["file"]))
+            items.append(it)
+            by_file[key] = it
+            added += 1
+        else:
+            matched += 1
+            if e.get("title"):
+                it.title = e["title"]
+            if e.get("gme") and e["gme"] != it.url and e["gme"] not in it.alt_urls:
+                it.alt_urls.append(e["gme"])
+        it.image_url = e.get("image") or it.image_url
+        it.category = e.get("category") or it.category
+        it.page_url = e.get("page") or it.page_url
+        arts = e.get("articles") or []
+        if arts and not it.article:
+            it.article = arts[0]
+    return matched, added
+
+
 def load_catalog(cfg: dict | None = None, force: bool = False) -> Catalog:
     cfg = cfg or load_config()
     timeout = float(cfg.get("network_timeout_seconds", 25))
@@ -824,30 +1047,40 @@ def load_catalog(cfg: dict | None = None, force: bool = False) -> Catalog:
             enriched = enrich(items, meta)
     except TiptoiError:
         pass
+    portal, _t = load_portal_cache()
+    with_img = 0
+    if portal:
+        apply_portal(items, portal)
+    with_img = sum(1 for i in items if i.image_url)
     when = time.strftime("%d.%m.%Y %H:%M", time.localtime(mtime))
     info = f"{len(items)} Titel · Stand {when}" + (" (offline)" if from_cache and force else "")
-    if enriched:
+    if with_img:
+        info += f" · {with_img} mit Bild"
+    elif enriched:
         info += f" · {enriched} mit Beschreibung"
     return Catalog(items, info, list(cfg.get("image_urls") or []))
 
 
 def fetch_image(item: CatalogItem, templates: list[str], timeout: float = 15) -> bytes | None:
     """Vorschaubild holen (mit Festplatten-Zwischenspeicher)."""
-    if not item.article:
+    urls = item.image_urls(templates)
+    if not urls:
         return None
-    path = _cache_path("bilder", f"{item.article}.jpg")
+    key = hashlib.sha1("|".join(urls).encode("utf-8")).hexdigest()[:20]
+    path = _cache_path("bilder", key + ".img")
     miss = path + ".fehlt"
     if os.path.exists(path) and os.path.getsize(path) > 0:
         with open(path, "rb") as f:
             return f.read()
-    if os.path.exists(miss) and time.time() - os.path.getmtime(miss) < 7 * 86400:
+    if os.path.exists(miss) and time.time() - os.path.getmtime(miss) < 3 * 86400:
         return None
-    for url in item.image_urls(templates):
+    for url in urls:
         try:
             data = http_get(url, timeout=timeout)
         except TiptoiError:
             continue
-        if data[:3] == b"\xff\xd8\xff" or data[:8] == b"\x89PNG\r\n\x1a\n" or data[:4] == b"RIFF":
+        if (data[:3] == b"\xff\xd8\xff" or data[:8] == b"\x89PNG\r\n\x1a\n"
+                or data[:4] == b"RIFF" or data[:4] == b"GIF8"):
             with open(path, "wb") as f:
                 f.write(data)
             return data
@@ -913,8 +1146,8 @@ class SearchIndex:
             score += 20
         if it._title_f.startswith(phrase):
             score += 8
-        if it.description:
-            score += 1  # Einträge mit Beschreibung leicht bevorzugen
+        if it.description or it.image_url:
+            score += 1  # Einträge mit Beschreibung/Bild leicht bevorzugen
         return score
 
     def search(self, query: str) -> list[CatalogItem]:
@@ -1051,11 +1284,25 @@ def ensure_downloaded(item: CatalogItem, progress=None, cancel: threading.Event 
     if os.path.exists(path) and os.path.exists(meta_path):
         try:
             with open(meta_path, "r") as f:
-                if f.read().strip() == item.version:
-                    return path
+                cached = f.read().strip()
+            if item.version and cached == item.version:
+                return path
+            if not item.version and time.time() - os.path.getmtime(path) < 7 * 86400:
+                return path
         except OSError:
             pass
-    data = http_get(item.url, timeout=timeout, progress=progress, cancel=cancel)
+    data = None
+    last_err = None
+    for url in [item.url] + [u for u in item.alt_urls if u != item.url]:
+        try:
+            data = http_get(url, timeout=timeout, progress=progress, cancel=cancel)
+            break
+        except TiptoiError as e:
+            if str(e) == "Abgebrochen.":
+                raise
+            last_err = e
+    if data is None:
+        raise last_err or TiptoiError("Download fehlgeschlagen.")
     if len(data) < 0x40:
         raise TiptoiError(f"Die heruntergeladene Datei für „{item.title}“ ist ungültig.")
     tmp = path + ".part"

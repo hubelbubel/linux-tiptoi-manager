@@ -56,13 +56,16 @@ Wird der Stift nicht erkannt (z. B. weil das Laufwerk anders heißt), wähle im 
 
 | Was | Quelle |
 |---|---|
-| Liste aller Audiodateien + Downloads | Offizielle Datei `https://cdn.ravensburger.de/db/tiptoi.csv` (öffentlich, täglich neu geladen) |
-| Titel, Beschreibungen, Artikelnummern | Öffentliche Übersicht `http://tiptoi.vakat.de/` (wöchentlich neu geladen) |
-| Vorschaubilder | Ravensburger-Bildserver über die Artikelnummer |
+| Liste aller Audiodateien + Downloads | Offizielle Datei `https://cdn.ravensburger.de/db/tiptoi.csv` (täglich neu geladen) |
+| **Vorschaubilder, Titel, Kategorien, Artikelnummern** | Offizielles Serviceportal [service.ravensburger.de → tiptoi® Audiodateien](https://service.ravensburger.de/tiptoi%C2%AE/tiptoi%C2%AE_Audiodateien) (wöchentlich neu geladen) |
+| Zusätzliche Beschreibungen | Öffentliche Übersicht `http://tiptoi.vakat.de/` |
 
-**Hinweis:** Ravensburgers vollständiger Katalog mit Bildern und Texten ist nur mit Anmeldung über die offizielle App erreichbar. Deshalb nutzt die App die öffentlichen Quellen oben.
-Folge: Bei Titeln ohne Eintrag in der Übersicht siehst du statt Foto eine farbige Kachel mit Initialen. Der Titel kommt dann aus dem Dateinamen.
-Alle Downloads selbst kommen immer direkt von Ravensburger.
+Die App liest die Produktseiten des Serviceportals aus. Jede Seite hat ein Produktbild und einen Download-Link. Über den Dateinamen ordnet die App beides dem Katalog zu. Titel, die nur im Portal stehen, kommen zusätzlich in die Suche.
+
+**Erster Start:** Das Auslesen dauert einmalig etwas, je nach Verbindung etwa eine bis wenige Minuten. Den Fortschritt siehst du auf der Startseite. Die Suche funktioniert in der Zeit schon, die Bilder erscheinen danach automatisch. Das Ergebnis wird eine Woche gespeichert. Neu laden geht über das Menü (☰) → **Vorschaubilder neu laden**.
+
+Findet die App für einen Titel kein Bild, zeigt sie eine farbige Kachel mit Initialen.
+Downloads kommen immer direkt von Ravensburger. Ist eine Adresse nicht erreichbar, versucht die App automatisch die Adresse aus dem Serviceportal.
 
 Die Adressen lassen sich in `~/.config/tiptoi-manager/config.json` anpassen, falls sich eine Quelle ändert.
 Zwischenspeicher: `~/.cache/tiptoi-manager/`. Leeren über das Menü oder durch Löschen des Ordners.
@@ -79,6 +82,7 @@ Die Tests brauchen weder GTK noch Internet noch einen echten Stift:
 
 ```bash
 python3 tests/test_core.py        # Katalog, Suche, GME-Header, Kopieren auf simulierten Stift
+python3 tests/test_portal.py      # Auslesen des Serviceportals mit nachgebauten Seiten
 python3 tests/test_gui_smoke.py   # Abläufe der Oberfläche mit einer GTK-Attrappe
 ```
 

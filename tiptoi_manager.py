@@ -229,9 +229,9 @@ class ImageLoader:
         self.pending = {}
 
     def request(self, item, templates, callback):
-        if item is None or not item.article:
+        if item is None or not item.image_key:
             return
-        a = item.article
+        a = item.image_key
         if a in self.mem:
             if self.mem[a] is not None:
                 callback(self.mem[a])
@@ -257,7 +257,7 @@ class ImageLoader:
                     pb = pb.scale_simple(max(1, int(w * s)), max(1, int(h * s)), GdkPixbuf.InterpType.BILINEAR)
         except Exception:
             pb = None
-        GLib.idle_add(self._done, item.article, pb)
+        GLib.idle_add(self._done, item.image_key, pb)
 
     def _done(self, article, pb):
         self.mem[article] = pb
@@ -312,7 +312,7 @@ class ResultRow(Gtk.ListBoxRow, TransferMixin):
 
         col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
         col.set_hexpand(True)
-        meta = f"{item.file_name}"
+        meta = f"{item.category}  ·  {item.file_name}" if item.category else f"{item.file_name}"
         if item.version:
             meta += f"  ·  Version {core.format_version(item.version)}"
         if item.article:
@@ -332,9 +332,17 @@ class ResultRow(Gtk.ListBoxRow, TransferMixin):
         d.set_margin_top(2)
         col.pack_start(d, False, False, 0)
 
+        bottom = Gtk.Box(spacing=10)
+        bottom.set_margin_top(4)
         self.badges = Gtk.Box(spacing=6)
-        self.badges.set_margin_top(4)
-        col.pack_start(self.badges, False, False, 0)
+        bottom.pack_start(self.badges, False, False, 0)
+        if item.page_url:
+            link = Gtk.LinkButton.new_with_label(item.page_url, "Produktseite ↗")
+            link.set_tooltip_text("Offizielle Seite bei Ravensburger öffnen")
+            link.set_relief(Gtk.ReliefStyle.NONE)
+            link.get_style_context().add_class("small")
+            bottom.pack_start(link, False, False, 0)
+        col.pack_start(bottom, False, False, 0)
         self._build_progress(col)
         outer.pack_start(col, True, True, 0)
 
@@ -402,7 +410,8 @@ class InstalledRow(Gtk.ListBoxRow, TransferMixin):
         col.set_hexpand(True)
         col.set_valign(Gtk.Align.CENTER)
         col.pack_start(label(f"<b>{esc(inst.title)}</b>", markup=True, wrap=True, max_chars=70), False, False, 0)
-        parts = [inst.kind, inst.file_name, core.format_size(inst.size)]
+        kind = inst.catalog.category if (inst.catalog and inst.catalog.category) else inst.kind
+        parts = [kind, inst.file_name, core.format_size(inst.size)]
         if inst.version:
             parts.append("Version " + core.format_version(inst.version))
         if inst.header and inst.header.product_id is not None:
@@ -488,6 +497,8 @@ class MainWindow(Gtk.ApplicationWindow):
         self._toast_timer = 0
         self._last_post = {}
         self._ejecting = False
+        self._portal_running = False
+        self._portal_tried = False
 
         self._build_actions()
         self._build_ui()
@@ -515,7 +526,8 @@ class MainWindow(Gtk.ApplicationWindow):
         add("focus-search", lambda *_: self.focus_search(), ["<Control>f", "<Control>l"])
         add("refresh", lambda *_: self.refresh_devices(), ["F5"])
         add("choose-folder", lambda *_: self.choose_folder())
-        add("reload-catalog", lambda *_: self.load_catalog(force=True))
+        add("reload-catalog", lambda *_: (self.load_catalog(force=True), self.crawl_portal(force=True)))
+        add("reload-portal", lambda *_: self.crawl_portal(force=True))
         add("clear-cache", lambda *_: self.clear_cache())
         add("clear-history", lambda *_: self.clear_history())
         add("show-installed", lambda *_: self.main_stack.set_visible_child_name("installed"), ["<Control>2"])
@@ -544,6 +556,7 @@ class MainWindow(Gtk.ApplicationWindow):
         menu.append_section(None, sec1)
         sec2 = Gio.Menu()
         sec2.append("Katalog neu laden", "win.reload-catalog")
+        sec2.append("Vorschaubilder neu laden", "win.reload-portal")
         sec2.append("Suchverlauf löschen", "win.clear-history")
         sec2.append("Download-Zwischenspeicher leeren", "win.clear-cache")
         menu.append_section(None, sec2)
@@ -825,7 +838,8 @@ class MainWindow(Gtk.ApplicationWindow):
         self.cat_spinner.start()
         self.cat_spinner.show()
         self.cat_retry.hide()
-        self.cat_status.set_text("Katalog wird geladen …")
+        if not self._portal_running:
+            self.cat_status.set_text("Katalog wird geladen …")
 
         def work():
             try:
@@ -836,8 +850,9 @@ class MainWindow(Gtk.ApplicationWindow):
         threading.Thread(target=work, daemon=True).start()
 
     def _catalog_loaded(self, cat, err):
-        self.cat_spinner.stop()
-        self.cat_spinner.hide()
+        if not self._portal_running:
+            self.cat_spinner.stop()
+            self.cat_spinner.hide()
         if err is not None:
             self.catalog_error = err
             self.cat_status.set_text(f"Katalog nicht verfügbar: {err}")
@@ -849,11 +864,64 @@ class MainWindow(Gtk.ApplicationWindow):
         self.catalog_error = None
         self.cat_status.set_text(f"Durchsuche {cat.source_info} · Enter drücken zum Suchen")
         self.refresh_installed()
+        if not self._portal_tried and core.portal_cache_stale(self.cfg):
+            self.crawl_portal()
         if self.pending_query:
             q, self.pending_query = self.pending_query, None
             self.run_search(q)
         elif self.current_query:
             self.run_search(self.current_query, add_history=False)
+        return False
+
+    # ------------------------------------------------- Bilder aus dem Serviceportal
+    def crawl_portal(self, force=False):
+        """Holt Bilder/Titel/Kategorien von service.ravensburger.de (im Hintergrund, 7 Tage gespeichert)."""
+        if self._portal_running:
+            return
+        if not force and not core.portal_cache_stale(self.cfg):
+            return
+        self._portal_running = True
+        self._portal_tried = True
+        self.cat_spinner.show()
+        self.cat_spinner.start()
+        self.cat_status.set_text("Vorschaubilder werden von service.ravensburger.de geholt …")
+        last = [0.0]
+
+        def progress(done, total, found):
+            now = time.monotonic()
+            if now - last[0] > 0.3:
+                last[0] = now
+                GLib.idle_add(self._portal_progress, done, total, found)
+
+        def work():
+            try:
+                entries = core.crawl_portal(self.cfg, progress=progress)
+                if entries:
+                    core.save_portal_cache(entries)
+                GLib.idle_add(self._portal_done, len(entries), None)
+            except Exception as e:  # noqa: BLE001
+                GLib.idle_add(self._portal_done, 0, str(e))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _portal_progress(self, done, total, found):
+        if self._portal_running:
+            self.cat_status.set_text(f"Vorschaubilder werden vorbereitet … {done} von ca. {total} Seiten, "
+                                     f"{found} Produkte gefunden (einmalig, danach gespeichert)")
+        return False
+
+    def _portal_done(self, n, err):
+        self._portal_running = False
+        self.cat_spinner.stop()
+        self.cat_spinner.hide()
+        if err:
+            info = self.catalog.source_info if self.catalog else ""
+            self.cat_status.set_text(f"{info} · Vorschaubilder nicht verfügbar ({err})")
+            return False
+        if n:
+            self.toast(f"Vorschaubilder und Titel für {n} Produkte geladen.")
+            self.load_catalog()  # Katalog mit den neuen Daten aus dem Zwischenspeicher neu zusammensetzen
+        else:
+            self.cat_status.set_text("Im Serviceportal wurden keine Produktseiten gefunden.")
         return False
 
     # ---------------------------------------------------------------- Suche

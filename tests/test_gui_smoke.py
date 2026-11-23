@@ -18,10 +18,19 @@ def fake_dl(item, progress=None, cancel=None, timeout=60):
     if progress: progress(100, 200); progress(200, 200)
     return p
 core.ensure_downloaded = fake_dl
+crawled = []
+def fake_crawl(cfg=None, progress=None, cancel=None):
+    crawled.append(1)
+    if progress: progress(5, 10, 2)
+    return [{"title": "Wieso? Weshalb? Warum? Bauernhof", "articles": ["32900"], "category": "Bücher",
+             "image": "https://service.ravensburger.de/@api/deki/files/1/x.png", "gme": "https://x/WWW_Bauernhof.gme",
+             "file": "WWW_Bauernhof.gme", "page": "https://service.ravensburger.de/p"}]
+core.crawl_portal = fake_crawl
 
 app = ui.App(); app.do_startup()
 w = ui.MainWindow(app)
 time.sleep(0.5)
+print("portal crawled:", len(crawled), "| cache stale now:", core.portal_cache_stale(), "| status:", w.cat_status.get_text())
 print("catalog:", w.catalog is cat, "| status:", w.cat_status.get_text())
 print("device:", w.device and w.device.display_name, "| name label:", w.dev_name.get_text(), "| details:", w.dev_details.get_text())
 print("storage:", w.storage_label.get_text(), "| eject visible:", w.eject_btn.get_visible())
