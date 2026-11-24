@@ -24,6 +24,9 @@ import re
 import shutil
 import struct
 import subprocess
+import sys
+import tarfile
+import tempfile
 import threading
 import time
 import unicodedata
@@ -43,7 +46,7 @@ except Exception:  # pragma: no cover
     Gio = None
 
 APP_NAME = "tiptoi Manager"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 USER_AGENT = f"tiptoi-manager-linux/{APP_VERSION} (+Linux Mint)"
 
 # --------------------------------------------------------------------------
@@ -74,6 +77,10 @@ DEFAULT_CONFIG = {
         "https://static.images.ravensburger.de/images/produktseiten/210/{article5}.jpg",
         "http://static.images.ravensburger.de/images/produktseiten/210/{article5}.jpg",
     ],
+    # Updates aus dem GitHub-Repo
+    "check_updates_on_start": True,
+    "update_info_url": "https://raw.githubusercontent.com/hubelbubel/linux-tiptoi-manager/main/version.json",
+    "update_archive_url": "https://codeload.github.com/hubelbubel/linux-tiptoi-manager/tar.gz/refs/heads/main",
     "catalog_max_age_hours": 24,
     "metadata_max_age_hours": 24 * 7,
     "network_timeout_seconds": 25,
@@ -1386,3 +1393,114 @@ def clear_download_cache() -> int:
             except OSError:
                 pass
     return total
+
+
+# --------------------------------------------------------------------------
+# Programm-Updates (aus dem GitHub-Repo)
+# --------------------------------------------------------------------------
+
+PROGRAM_DIR = os.path.dirname(os.path.realpath(__file__))
+INSTALL_DIR = os.path.join(_xdg("XDG_DATA_HOME", os.path.join(".local", "share")), "tiptoi-manager")
+
+
+def parse_version(v: str) -> tuple:
+    nums = [int(x) for x in re.findall(r"\d+", v or "")[:3]]
+    return tuple(nums + [0] * (3 - len(nums)))
+
+
+@dataclass
+class UpdateInfo:
+    version: str
+    date: str = ""
+    changes: list = field(default_factory=list)
+
+    @property
+    def newer(self) -> bool:
+        return parse_version(self.version) > parse_version(APP_VERSION)
+
+
+def check_for_update(cfg: dict | None = None, timeout: float = 15) -> UpdateInfo:
+    """Liest version.json aus dem Repo. Wirft TiptoiError, wenn GitHub nicht erreichbar ist."""
+    cfg = cfg or load_config()
+    url = cfg["update_info_url"]
+    sep = "&" if "?" in url else "?"
+    data = http_get(f"{url}{sep}t={int(time.time() // 60)}", timeout=timeout)  # Cache umgehen
+    try:
+        d = json.loads(_decode_text(data))
+        version = str(d["version"]).strip()
+    except (ValueError, KeyError, TypeError) as e:
+        raise TiptoiError("Die Update-Information auf GitHub ist ungültig.") from e
+    changes = d.get("changes") or []
+    if isinstance(changes, str):
+        changes = [changes]
+    return UpdateInfo(version, str(d.get("date") or ""), [str(c) for c in changes])
+
+
+def _safe_extract(tar: tarfile.TarFile, dest: str) -> None:
+    base = os.path.realpath(dest)
+    for m in tar.getmembers():
+        target = os.path.realpath(os.path.join(dest, m.name))
+        if not (target == base or target.startswith(base + os.sep)):
+            raise TiptoiError("Das Update-Archiv enthält ungültige Pfade.")
+        if not (m.isfile() or m.isdir()):
+            raise TiptoiError("Das Update-Archiv enthält unerwartete Dateitypen.")
+    if hasattr(tarfile, "data_filter"):
+        tar.extractall(dest, filter="data")
+    else:  # Python < 3.12
+        tar.extractall(dest)
+
+
+def _run(cmd, cwd=None, timeout=180):
+    r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+    if r.returncode != 0:
+        msg = (r.stderr or r.stdout or "").strip().splitlines()
+        raise TiptoiError("Update fehlgeschlagen: " + (msg[-1] if msg else f"Fehlercode {r.returncode}"))
+    return r.stdout
+
+
+def install_update(cfg: dict | None = None, progress=None) -> str:
+    """Installiert die neueste Version. Gibt den Pfad des Programms zurück, das neu gestartet werden soll.
+
+    * Läuft das Programm aus einem git-Klon: git pull + install.sh
+    * sonst: Archiv von GitHub laden, prüfen, install.sh daraus ausführen
+    """
+    cfg = cfg or load_config()
+
+    def step(text):
+        if progress:
+            progress(text)
+
+    if os.path.isdir(os.path.join(PROGRAM_DIR, ".git")) and shutil.which("git"):
+        step("Neueste Version wird mit git geholt …")
+        _run(["git", "-C", PROGRAM_DIR, "pull", "--ff-only"])
+        step("Wird installiert …")
+        _run(["bash", os.path.join(PROGRAM_DIR, "install.sh")], cwd=PROGRAM_DIR)
+        return os.path.join(PROGRAM_DIR, "tiptoi_manager.py")
+
+    step("Neueste Version wird heruntergeladen …")
+    data = http_get(cfg["update_archive_url"], timeout=60)
+    with tempfile.TemporaryDirectory(prefix="tiptoi-update-") as tmp:
+        try:
+            with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tar:
+                _safe_extract(tar, tmp)
+        except tarfile.TarError as e:
+            raise TiptoiError("Das Update-Archiv ist beschädigt.") from e
+        top = None
+        for root, _dirs, files in os.walk(tmp):
+            if "install.sh" in files and "tiptoi_core.py" in files and "tiptoi_manager.py" in files:
+                top = root
+                break
+        if top is None:
+            raise TiptoiError("Im Update-Archiv fehlen Programmdateien.")
+        with open(os.path.join(top, "tiptoi_core.py"), "r", encoding="utf-8") as f:
+            m = re.search(r'APP_VERSION\s*=\s*"([^"]+)"', f.read())
+        if not m:
+            raise TiptoiError("Die Version im Update-Archiv ist nicht lesbar.")
+        step(f"Version {m.group(1)} wird installiert …")
+        _run([sys.executable, "-m", "py_compile", os.path.join(top, "tiptoi_core.py"),
+              os.path.join(top, "tiptoi_manager.py")])
+        _run(["bash", os.path.join(top, "install.sh")], cwd=top)
+    # install.sh installiert nach ~/.local/share/tiptoi-manager
+    if os.path.realpath(PROGRAM_DIR) == os.path.realpath(INSTALL_DIR):
+        return os.path.join(PROGRAM_DIR, "tiptoi_manager.py")
+    return os.path.join(INSTALL_DIR, "tiptoi_manager.py")

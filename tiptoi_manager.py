@@ -499,6 +499,9 @@ class MainWindow(Gtk.ApplicationWindow):
         self._ejecting = False
         self._portal_running = False
         self._portal_tried = False
+        self.update_info = None
+        self._update_state = "idle"  # idle | checking | available | installing | done
+        self._restart_path = None
 
         self._build_actions()
         self._build_ui()
@@ -513,6 +516,8 @@ class MainWindow(Gtk.ApplicationWindow):
         self._post_show()
         self.refresh_devices()
         self.load_catalog()
+        if self.cfg.get("check_updates_on_start", True):
+            GLib.timeout_add_seconds(3, lambda: (self.check_updates(manual=False), False)[1])
 
     # ---------------------------------------------------------------- Aufbau
     def _build_actions(self):
@@ -528,6 +533,7 @@ class MainWindow(Gtk.ApplicationWindow):
         add("choose-folder", lambda *_: self.choose_folder())
         add("reload-catalog", lambda *_: (self.load_catalog(force=True), self.crawl_portal(force=True)))
         add("reload-portal", lambda *_: self.crawl_portal(force=True))
+        add("check-updates", lambda *_: self.check_updates(manual=True))
         add("clear-cache", lambda *_: self.clear_cache())
         add("clear-history", lambda *_: self.clear_history())
         add("show-installed", lambda *_: self.main_stack.set_visible_child_name("installed"), ["<Control>2"])
@@ -561,6 +567,7 @@ class MainWindow(Gtk.ApplicationWindow):
         sec2.append("Download-Zwischenspeicher leeren", "win.clear-cache")
         menu.append_section(None, sec2)
         sec3 = Gio.Menu()
+        sec3.append("Nach Updates suchen …", "win.check-updates")
         sec3.append("Über tiptoi Manager", "app.about")
         sec3.append("Beenden", "app.quit")
         menu.append_section(None, sec3)
@@ -574,6 +581,7 @@ class MainWindow(Gtk.ApplicationWindow):
         self.add(overlay)
         root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         overlay.add(root)
+        root.pack_start(self._build_update_bar(), False, False, 0)
         root.pack_start(self._build_device_bar(), False, False, 0)
         root.pack_start(self.main_stack, True, True, 0)
 
@@ -596,6 +604,160 @@ class MainWindow(Gtk.ApplicationWindow):
         tbox.pack_start(tclose, False, False, 0)
         self.toast_rev.add(tbox)
         overlay.add_overlay(self.toast_rev)
+
+    def _build_update_bar(self):
+        # InfoBar in einem eigenen Revealer (GTK3-InfoBars erscheinen nach hide() sonst nicht zuverlässig)
+        self.update_rev = Gtk.Revealer()
+        self.update_rev.set_transition_type(Gtk.RevealerTransitionType.SLIDE_DOWN)
+        bar = Gtk.InfoBar()
+        bar.set_message_type(Gtk.MessageType.INFO)
+        bar.set_show_close_button(True)
+        area = bar.get_content_area()
+        self.update_spinner = Gtk.Spinner()
+        area.add(self.update_spinner)
+        self.update_label = label("", wrap=True, markup=True)
+        self.update_label.set_hexpand(True)
+        area.add(self.update_label)
+        self.btn_notes = bar.add_button("Was ist neu?", 1)
+        self.btn_update = bar.add_button("Jetzt aktualisieren", 2)
+        self.btn_update.get_style_context().add_class("suggested-action")
+        self.btn_restart = bar.add_button("Neu starten", 3)
+        self.btn_restart.get_style_context().add_class("suggested-action")
+        bar.connect("response", self._on_update_response)
+        self.update_infobar = bar
+        self.update_rev.add(bar)
+        return self.update_rev
+
+    def _show_update_bar(self, markup, spinner=False, notes=False, update=False, restart=False,
+                         kind=Gtk.MessageType.INFO):
+        self.update_infobar.set_message_type(kind)
+        self.update_label.set_markup(markup)
+        if spinner:
+            self.update_spinner.show()
+            self.update_spinner.start()
+        else:
+            self.update_spinner.stop()
+            self.update_spinner.hide()
+        self.btn_notes.set_visible(notes)
+        self.btn_update.set_visible(update)
+        self.btn_restart.set_visible(restart)
+        self.update_infobar.set_show_close_button(not spinner)
+        self.update_rev.set_reveal_child(True)
+
+    # --------------------------------------------------------------- Updates
+    def check_updates(self, manual=True):
+        if self._update_state in ("checking", "installing"):
+            return
+        if self._update_state == "done":
+            self._show_update_bar("<b>Update installiert.</b> Starte die App neu, um die neue Version zu nutzen.",
+                                  restart=True)
+            return
+        self._update_state = "checking"
+        if manual:
+            self._show_update_bar("Suche nach Updates …", spinner=True)
+
+        def work():
+            try:
+                info = core.check_for_update(self.cfg)
+                GLib.idle_add(self._update_checked, info, None, manual)
+            except core.TiptoiError as e:
+                GLib.idle_add(self._update_checked, None, str(e), manual)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _update_checked(self, info, err, manual):
+        self._update_state = "idle"
+        if err:
+            if manual:
+                self._show_update_bar(f"Update-Prüfung nicht möglich: {esc(err)}", kind=Gtk.MessageType.WARNING)
+            return False
+        if info.newer:
+            self.update_info = info
+            self._update_state = "available"
+            self._show_update_bar(f"<b>Version {esc(info.version)} ist verfügbar.</b> "
+                                  f"Du nutzt Version {esc(core.APP_VERSION)}.",
+                                  notes=bool(info.changes), update=True)
+        elif manual:
+            self._show_update_bar(f"Du nutzt die neueste Version ({esc(core.APP_VERSION)}).")
+            GLib.timeout_add_seconds(5, lambda: (self._hide_update_bar_if_idle(), False)[1])
+        return False
+
+    def _hide_update_bar_if_idle(self):
+        if self._update_state == "idle":
+            self.update_rev.set_reveal_child(False)
+
+    def _on_update_response(self, bar, response):
+        if response == 1:
+            self.show_update_notes()
+        elif response == 2:
+            self.install_update()
+        elif response == 3:
+            self.restart_app()
+        else:  # Schließen
+            if self._update_state not in ("checking", "installing"):
+                self.update_rev.set_reveal_child(False)
+
+    def show_update_notes(self):
+        info = self.update_info
+        if not info:
+            return
+        d = Gtk.MessageDialog(transient_for=self, modal=True, message_type=Gtk.MessageType.INFO,
+                              buttons=Gtk.ButtonsType.NONE, text=f"Neu in Version {info.version}")
+        text = "\n".join(f"• {c}" for c in info.changes) or "Keine Details angegeben."
+        if info.date:
+            text += f"\n\nVeröffentlicht: {core.format_version(info.date.replace('-', ''))}"
+        d.format_secondary_text(text)
+        d.add_button("Schließen", Gtk.ResponseType.CLOSE)
+        b = d.add_button("Jetzt aktualisieren", Gtk.ResponseType.ACCEPT)
+        b.get_style_context().add_class("suggested-action")
+        resp = d.run()
+        d.destroy()
+        if resp == Gtk.ResponseType.ACCEPT:
+            self.install_update()
+
+    def install_update(self):
+        if self._update_state == "installing":
+            return
+        if self.transfers:
+            self.toast("Bitte warte, bis alle Übertragungen fertig sind.")
+            return
+        self._update_state = "installing"
+        version = self.update_info.version if self.update_info else ""
+        self._show_update_bar(f"Version {esc(version)} wird installiert …", spinner=True)
+
+        def step(text):
+            GLib.idle_add(lambda: (self.update_label.set_text(text), False)[1])
+
+        def work():
+            try:
+                path = core.install_update(self.cfg, progress=step)
+                GLib.idle_add(self._update_installed, path, None)
+            except core.TiptoiError as e:
+                GLib.idle_add(self._update_installed, None, str(e))
+            except Exception as e:  # noqa: BLE001
+                GLib.idle_add(self._update_installed, None, f"Unerwarteter Fehler: {e}")
+        threading.Thread(target=work, daemon=True).start()
+
+    def _update_installed(self, path, err):
+        if err:
+            self._update_state = "available" if self.update_info else "idle"
+            self._show_update_bar(f"<b>Update fehlgeschlagen.</b> {esc(err.replace('Update fehlgeschlagen: ', ''))}", update=bool(self.update_info),
+                                  kind=Gtk.MessageType.ERROR)
+            return False
+        self._update_state = "done"
+        self._restart_path = path
+        self._show_update_bar("<b>Update installiert.</b> Starte die App neu, um die neue Version zu nutzen.",
+                              restart=True)
+        return False
+
+    def restart_app(self):
+        if self.transfers:
+            self.toast("Bitte warte, bis alle Übertragungen fertig sind.")
+            return
+        path = self._restart_path or os.path.join(HERE, "tiptoi_manager.py")
+        try:
+            os.execv(sys.executable, [sys.executable, path])
+        except OSError as e:
+            self.error_dialog("Neustart nicht möglich", f"{e}\n\nBitte die App von Hand neu starten.")
 
     def _build_device_bar(self):
         bar = Gtk.Box(spacing=14)
@@ -805,6 +967,8 @@ class MainWindow(Gtk.ApplicationWindow):
 
     def _post_show(self):
         # Elemente, die erst bei Bedarf erscheinen
+        for w in (self.update_spinner, self.btn_notes, self.btn_update, self.btn_restart):
+            w.hide()
         for w in (self.dym_label, self.no_results, self.more_btn, self.cat_retry, self.cat_spinner,
                   self.update_all_btn, self.dev_combo, self.storage_box, self.eject_btn):
             w.hide()

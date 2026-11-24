@@ -29,13 +29,24 @@ Falls das Skript meldet, dass Python-GTK fehlt (bei Mint eigentlich nie):
 
 ## Aktualisieren
 
+**Ab Version 1.3.0 direkt in der App:** Beim Start prüft die App, ob es auf GitHub eine neuere Version gibt. Wenn ja, erscheint oben ein Hinweis:
+
+- **Was ist neu?** zeigt die Änderungen.
+- **Jetzt aktualisieren** lädt die neue Version und installiert sie.
+- **Neu starten** startet danach die neue Version.
+
+Von Hand prüfen: Menü (☰) → **Nach Updates suchen …**
+Die automatische Prüfung lässt sich in `~/.config/tiptoi-manager/config.json` mit `"check_updates_on_start": false` abschalten.
+
+**Von Version 1.2.0 oder älter** (einmalig von Hand, weil die Update-Funktion dort noch fehlt):
+
 ```bash
 cd ~/Projekte/linux-tiptoi-manager   # dort, wo du das Repo geklont hast
 git pull
 ./install.sh
 ```
 
-Danach die App neu starten. Deine Einstellungen, der Suchverlauf und die Inhalte auf dem Stift bleiben erhalten.
+Einstellungen, Suchverlauf und die Inhalte auf dem Stift bleiben bei jedem Update erhalten.
 
 Deinstallieren: `./uninstall.sh`
 
@@ -83,8 +94,17 @@ Die Tests brauchen weder GTK noch Internet noch einen echten Stift:
 ```bash
 python3 tests/test_core.py        # Katalog, Suche, GME-Header, Kopieren auf simulierten Stift
 python3 tests/test_portal.py      # Auslesen des Serviceportals mit nachgebauten Seiten
+python3 tests/test_update.py      # Update über GitHub-Archiv und git pull, Schutz vor manipulierten Archiven
 python3 tests/test_gui_smoke.py   # Abläufe der Oberfläche mit einer GTK-Attrappe
 ```
+
+## Neue Version veröffentlichen
+
+1. `APP_VERSION` in `tiptoi_core.py` erhöhen.
+2. In `version.json` dieselbe Version, das Datum und die Änderungen eintragen.
+3. Committen und auf `main` pushen. Die Apps finden das Update beim nächsten Start.
+
+`tests/test_update.py` prüft, dass beide Versionsnummern übereinstimmen.
 
 ## Rechtliches
 

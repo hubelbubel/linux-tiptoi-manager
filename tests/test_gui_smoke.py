@@ -78,4 +78,23 @@ print("no device:", w.dev_name.get_text(), w.inst_stack.get_visible_child_name()
 w.run_search("bauernhof"); print("states no device:", [w.state_for(r.item) for r in w.result_rows.values()])
 w.install(items[0]); print("install w/o device toast:", w.toast_label.get_text())
 print("delete-event ok:", w._on_delete() is False)
+# Updates
+core.check_for_update = lambda cfg=None, timeout=15: core.UpdateInfo("9.9.9", "2026-11-24", ["Neu A", "Neu B"])
+w.check_updates(manual=False); time.sleep(0.3)
+print("update bar:", w.update_label.get_text(), "| state:", w._update_state, "| btn update:", w.btn_update.get_visible())
+core.install_update = lambda cfg=None, progress=None: (progress and progress("Wird installiert …"), "/x/tiptoi_manager.py")[1]
+w._on_update_response(None, 2); time.sleep(0.3)
+print("after install:", w.update_label.get_text(), "| state:", w._update_state, "| restart btn:", w.btn_restart.get_visible())
+execs = []
+ui.os.execv = lambda exe, args: execs.append(args)
+w._on_update_response(None, 3); print("restart exec:", execs)
+w._update_state = "idle"
+core.check_for_update = lambda cfg=None, timeout=15: core.UpdateInfo(core.APP_VERSION)
+w.check_updates(manual=True); time.sleep(0.3); print("manual no update:", w.update_label.get_text())
+def boom(cfg=None, timeout=15): raise core.TiptoiError("Keine Verbindung zu raw.githubusercontent.com")
+core.check_for_update = boom; w.check_updates(manual=True); time.sleep(0.3); print("manual error:", w.update_label.get_text())
+core.check_for_update = lambda cfg=None, timeout=15: core.UpdateInfo("9.9.9")
+def fail(cfg=None, progress=None): raise core.TiptoiError("Update fehlgeschlagen: kaputt")
+core.install_update = fail; w.check_updates(manual=False); time.sleep(0.2); w.install_update(); time.sleep(0.3)
+print("install error:", w.update_label.get_text(), "| state:", w._update_state)
 print("SMOKE OK")
